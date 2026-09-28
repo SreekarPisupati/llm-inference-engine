@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+models/
+*.safetensors
+*.bin
+*.pt
+*.gguf
+
+# Local working files (never committed to the public repo)
+context/
+PLAN.md
+CLOUD_DAY.md
