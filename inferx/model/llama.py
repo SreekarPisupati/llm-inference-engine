@@ -1,15 +1,15 @@
 """From-scratch Llama architecture, weight-compatible with HuggingFace.
 
 Module structure and parameter names mirror HF's ``LlamaForCausalLM`` exactly,
-so a real checkpoint can be loaded with ``load_state_dict``. The forward pass
-is our own — we control the attention, so we can later swap in paged attention
-and custom CUDA kernels.
+so a real checkpoint can be loaded with ``load_state_dict``. The forward pass is
+our own — we control the attention, so we can swap in paged attention and
+custom CUDA kernels later.
 
-Current scope: full-sequence (causal) forward with plain RoPE + GQA + SwiGLU.
-KV-cache, speculative decoding, and quantization are layered on next.
+Scope now: causal forward with plain RoPE + GQA + SwiGLU, plus an optional
+KV cache for incremental (decode-step) inference.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -44,12 +44,11 @@ class RMSNorm(nn.Module):
 # ---------------------------------------------------------------------------
 # Rotary position embeddings (RoPE)
 # ---------------------------------------------------------------------------
-def precompute_rope(head_dim, seq_len, theta=10000.0, device=None):
-    """Return (cos, sin) of shape (seq_len, head_dim) for positions 0..seq_len-1."""
+def rope_cos_sin(head_dim, positions, theta=10000.0, device=None):
+    """Return (cos, sin) of shape (len(positions), head_dim) for those positions."""
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
-    t = torch.arange(seq_len, dtype=torch.float32, device=device)
-    freqs = torch.outer(t, inv_freq)          # (seq_len, head_dim // 2)
-    emb = torch.cat([freqs, freqs], dim=-1)   # (seq_len, head_dim)
+    freqs = torch.outer(positions.to(torch.float32), inv_freq)  # (n_pos, head_dim // 2)
+    emb = torch.cat([freqs, freqs], dim=-1)                     # (n_pos, head_dim)
     return emb.cos(), emb.sin()
 
 
@@ -68,14 +67,20 @@ def apply_rotary(q, k, cos, sin):
     return q, k
 
 
-def causal_mask(seq, device, dtype):
-    """Additive upper-triangular -inf mask: token i attends to positions <= i."""
-    mask = torch.full((seq, seq), float("-inf"), device=device, dtype=dtype)
-    return torch.triu(mask, diagonal=1)
+def causal_mask(seq, total, past_len, device, dtype):
+    """Additive mask of shape (seq, total).
+
+    Query i (absolute position past_len + i) may attend to keys 0..past_len+i.
+    Handles prefill (past_len=0), decode (seq=1), and chunked prefill generally.
+    """
+    q_pos = torch.arange(past_len, past_len + seq, device=device).unsqueeze(1)  # (seq, 1)
+    k_pos = torch.arange(total, device=device).unsqueeze(0)                     # (1, total)
+    allowed = k_pos <= q_pos
+    return torch.zeros((seq, total), device=device, dtype=dtype).masked_fill(~allowed, float("-inf"))
 
 
 # ---------------------------------------------------------------------------
-# Attention (GQA) — no cache yet
+# Attention (GQA) with optional KV cache
 # ---------------------------------------------------------------------------
 class Attention(nn.Module):
     def __init__(self, config: LlamaConfig):
@@ -89,16 +94,24 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
 
-    def forward(self, x, cos, sin, mask):
+    def forward(self, x, cos, sin, cache=None, layer_idx=0, past_len=0):
         bsz, seq, _ = x.shape
         q = self.q_proj(x).view(bsz, seq, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(bsz, seq, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(bsz, seq, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q, k = apply_rotary(q, k, cos, sin)
+
+        if cache is not None:
+            cache.write(layer_idx, k, v)
+            total = past_len + seq
+            k, v = cache.read(layer_idx, total)
+        else:
+            total = seq
+
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
         attn = (q @ k.transpose(-1, -2)) * self.scale
-        attn = attn + mask
+        attn = attn + causal_mask(seq, total, past_len, x.device, attn.dtype)
         attn = torch.softmax(attn, dim=-1, dtype=torch.float32)
         out = (attn @ v).transpose(1, 2).contiguous().view(bsz, seq, -1)
         return self.o_proj(out)
@@ -138,8 +151,8 @@ class TransformerBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos, sin, mask):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, mask)
+    def forward(self, x, cos, sin, cache=None, layer_idx=0, past_len=0):
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache, layer_idx, past_len)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -155,14 +168,23 @@ class LlamaModel(nn.Module):
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, cache=None, position_ids=None):
         bsz, seq = input_ids.shape
+        past = cache.len if cache is not None else 0
+        if position_ids is None:
+            position_ids = torch.arange(past, past + seq, device=input_ids.device)
+
+        cos, sin = rope_cos_sin(
+            self.config.head_dim, position_ids, self.config.rope_theta, input_ids.device
+        )
         x = self.embed_tokens(input_ids)
-        cos, sin = precompute_rope(self.config.head_dim, seq, self.config.rope_theta, input_ids.device)
-        mask = causal_mask(seq, input_ids.device, x.dtype)
-        for layer in self.layers:
-            x = layer(x, cos, sin, mask)
-        return self.norm(x)
+        for i, layer in enumerate(self.layers):
+            x = layer(x, cos, sin, cache, i, past)
+        x = self.norm(x)
+
+        if cache is not None:
+            cache.advance(seq)
+        return x
 
 
 class LlamaForCausalLM(nn.Module):
@@ -174,5 +196,6 @@ class LlamaForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, input_ids):
-        return self.lm_head(self.model(input_ids))
+    def forward(self, input_ids, cache=None, position_ids=None):
+        hidden = self.model(input_ids, cache=cache, position_ids=position_ids)
+        return self.lm_head(hidden)
